@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+
+  # The front door — handles all incoming requests
+  nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - frontend
+    restart: unless-stopped
+
+  # The Flask application
+  app:
+    build: ./app
+    env_file: .env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=cache
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+  # The database
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    env_file: .env
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # The cache
+  cache:
+    image: redis:7-alpine
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres-data:
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
