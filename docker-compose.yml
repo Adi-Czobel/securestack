@@ -1,8 +1,5 @@
 version: '3.8'
-
 services:
-
-  # The front door — handles all incoming requests
   nginx:
     build: ./nginx
     ports:
@@ -13,8 +10,16 @@ services:
     networks:
       - frontend
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
-  # The Flask application
   app:
     build: ./app
     env_file: .env
@@ -30,8 +35,15 @@ services:
       - frontend
       - backend
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
-  # The database
   db:
     image: postgres:16-alpine
     volumes:
@@ -47,8 +59,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
-  # The cache
   cache:
     image: redis:7-alpine
     networks:
@@ -59,10 +75,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
 volumes:
   postgres-data:
-
 networks:
   frontend:
     driver: bridge
