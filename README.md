@@ -1,101 +1,118 @@
 # SecureStack 🐋
 
-A multi-container REST API built with Docker Compose, designed around network isolation, least-privilege containers, and resource-bounded services.
+A small REST API running across four Docker containers, built to practise locking down a
+deployment rather than to be a big application. The app itself is a simple task list. The
+interesting part is how the containers are isolated from each other.
 
 ## Stack
 
-- **nginx** — Reverse proxy, entry point for all traffic
-- **Flask** — Python REST API
-- **PostgreSQL** — Database
-- **Redis** — Cache
+- **nginx** - reverse proxy, the only container the outside world can reach
+- **Flask** - Python REST API
+- **PostgreSQL** - database
+- **Redis** - cache
 
-## Security Design
+## Security design
 
-- **Network segmentation** — `db` and `cache` sit on an internal-only Docker network (`internal: true`) with no route to the outside world. `nginx` is on the `frontend` network only; `app` bridges `frontend` and `backend`. nginx therefore cannot reach the database at all, even though it is the internet-facing service.
-- **Only one published port** — `nginx` maps `80:80`. `app`, `db`, and `cache` publish nothing and are unreachable from the host.
-- **Non-root application container** — the Flask app runs as a dedicated unprivileged system user (`appuser`), not root.
-- **Read-only filesystems** — `nginx` and `app` run with `read_only: true`; the only writable paths are explicit `tmpfs` mounts scoped to what each service actually needs at runtime (`/tmp` for the app, `/var/cache/nginx` and `/var/run` for nginx).
-- **Resource limits** — every service has CPU and memory ceilings set via `deploy.resources.limits`, so no single container can exhaust host resources.
-- **Secrets kept out of the image** — credentials are injected via `.env` (gitignored) rather than hardcoded in `docker-compose.yml`; only `.env.example` is committed.
-- **Healthchecks gate startup order** — `db` and `cache` define healthchecks in Compose, `app` defines one in its Dockerfile. `depends_on: condition: service_healthy` means the app never starts against a database that isn't ready, and nginx never starts against a dead app.
+- **The database and cache are on a private network.** Docker lets you mark a network
+  `internal: true`, which cuts off all routing in and out of it. `db` and `cache` sit on
+  that network, so nothing outside the stack can reach them.
+- **nginx cannot reach the database either.** nginx is only on the `frontend` network. The
+  Flask app sits on both networks and acts as the bridge. So even if someone fully
+  compromised nginx, which is the container facing the internet, there is still no path
+  from there to Postgres or Redis.
+- **Only one port is published.** nginx maps `80:80`. The other three publish nothing, so
+  they are not reachable from the host at all.
+- **The app does not run as root.** `app/Dockerfile` creates a system user called `appuser`
+  and switches to it.
+- **Filesystems are read-only.** nginx and the app both run with `read_only: true`. The only
+  writable paths are small `tmpfs` mounts for the few directories each one actually needs
+  (`/tmp` for the app, `/var/cache/nginx` and `/var/run` for nginx). Anything written there
+  disappears on restart, so a dropped webshell does not survive.
+- **Every container has CPU and memory limits**, so one of them cannot starve the others.
+- **Passwords come from `.env`**, which is gitignored. Only `.env.example` with placeholder
+  values is committed.
+- **Healthchecks control startup order.** Postgres and Redis define healthchecks in Compose
+  and the app defines one in its Dockerfile. `depends_on: condition: service_healthy` means
+  the app never starts against a database that is not ready yet.
 
-## Threat model
+## What this protects against
 
-Scoped to a single-host Docker Compose deployment serving an HTTP API to untrusted clients.
-The assumed attacker reaches nginx over the network with no prior foothold on the host.
+The setup assumes an attacker who can reach nginx over the network and has no access to the
+host machine.
 
-| # | Threat | Control |
-|---|---|---|
-| 1 | Direct attack on the database | `backend` is `internal: true` and publishes no ports. Unreachable from host or internet. |
-| 2 | Pivot from the internet-facing service to the data tier | nginx is not attached to `backend`. A full nginx compromise still yields no route to Postgres or Redis. |
-| 3 | Container escape to host root | Application containers run as a non-root user (`appuser`). |
-| 4 | Persistence after compromise | Read-only root filesystems; writable paths are explicit `tmpfs` and vanish on restart, so a dropped webshell does not survive. |
-| 5 | Resource exhaustion by one service | Per-service CPU and memory limits on all four containers. |
-| 6 | Credentials committed to source | `.env` is gitignored; only placeholder values ship in `.env.example`. |
-| 7 | Traffic served by an unready backend | Healthchecks plus `depends_on: service_healthy` ordering. |
+| Threat | What stops it |
+| ------ | ------------- |
+| Attacking Postgres or Redis directly | They are on an internal network and publish no ports |
+| Breaking into nginx, then moving to the database | nginx has no route to the backend network |
+| Escaping the container to get root on the host | The app runs as a normal user, not root |
+| Leaving a backdoor behind after a break-in | Read-only filesystems, and tmpfs is wiped on restart |
+| One container eating all the CPU or memory | Per-container limits |
+| Database password ending up on GitHub | `.env` is gitignored, only the example file is committed |
+| Requests hitting a database that has not started | Healthchecks and startup ordering |
 
-### Out of scope
+## What it does not cover
 
-- **TLS termination.** This stack serves plain HTTP and assumes TLS terminates upstream at a
-  load balancer. Exposing it directly to the internet as-is would be wrong.
-- **Authentication and authorisation.** The API is deliberately unauthenticated; this repo
-  demonstrates deployment hardening, not application-layer access control.
-- **Host hardening.** Kernel, Docker daemon config, and OS patching are assumed handled.
-- **Image provenance.** Base images are trusted as pulled; no signing or SBOM verification.
-- **Secrets at rest.** `.env` is plaintext on disk. A real deployment would use Docker
-  secrets, Vault, or a cloud secrets manager.
+- **TLS.** The stack serves plain HTTP and expects something in front of it to handle HTTPS.
+  Do not put this straight on the internet as it is.
+- **Logins.** The API has no authentication. This project is about hardening the deployment,
+  not the application.
+- **The host machine.** Kernel updates, Docker daemon config, and OS patching are assumed to
+  be handled elsewhere.
+- **Where the images come from.** Base images are pulled and trusted as-is. No signature or
+  SBOM checking.
+- **Secrets on disk.** `.env` is a plain text file. A real deployment would use Docker
+  secrets or something like Vault.
 
 ## Architecture
 
-    Client → nginx (reverse proxy, read-only, port 80)
+    Client → nginx (read-only, port 80)          [frontend network]
                   │
                   ▼
-             Flask app (non-root, read-only)
+             Flask app (runs as appuser, read-only)   [frontend + backend]
              ┌────┴────┐
              ▼         ▼
-         PostgreSQL   Redis
-       (internal-only network, unreachable from host or internet)
+         PostgreSQL   Redis                      [backend network, internal only]
 
-## How to Run
+## How to run it
 
 ```bash
 git clone https://github.com/Adi-Czobel/securestack.git
 cd securestack
-cp .env.example .env     # then change the password
+cp .env.example .env     # change the password in it
 docker compose up -d --build
 curl http://localhost/tasks
 ```
 
-Requires Docker Engine 20.10+ with Compose V2.
+Needs Docker Engine 20.10 or newer with Compose V2.
 
-## Verifying the controls
+## Checking that it actually works
 
-Don't take this README's word for it. Each command proves one control is actually on.
+You can verify each control yourself instead of taking my word for it.
 
 ```bash
-# 1. nginx cannot reach the database — no route from frontend to backend
-docker compose exec nginx sh -c "nc -z -w2 db 5432 || echo 'BLOCKED (expected)'"
+# nginx cannot reach the database
+docker compose exec nginx sh -c "nc -z -w2 db 5432 || echo 'blocked, as expected'"
 
-# 2. The app container is not running as root
-docker compose exec app id                      # expect uid != 0, user appuser
+# the app is not running as root
+docker compose exec app id                      # uid should not be 0
 
-# 3. The app root filesystem is read-only
-docker compose exec app sh -c "touch /nope"     # expect: Read-only file system
+# the filesystem is read-only
+docker compose exec app sh -c "touch /nope"     # should say: Read-only file system
 
-# 4. ...but the tmpfs mount is writable
-docker compose exec app sh -c "touch /tmp/ok && echo 'tmpfs writable (expected)'"
+# but the tmpfs mount still works
+docker compose exec app sh -c "touch /tmp/ok && echo 'tmpfs is writable, as expected'"
 
-# 5. Resource ceilings are applied
+# limits are applied
 docker stats --no-stream
 
-# 6. Only nginx is published to the host
+# only nginx is published
 docker compose ps
 ```
 
 ## API
 
-| Method | Endpoint | Description   |
-| ------ | -------- | ------------- |
-| GET    | /tasks   | Get all tasks |
-| POST   | /tasks   | Create a task |
-| GET    | /health  | Health check  |
+| Method | Endpoint | Description |
+| ------ | -------- | ----------- |
+| GET | /tasks | Get all tasks (cached in Redis for 60s) |
+| POST | /tasks | Create a task (clears the cache) |
+| GET | /health | Health check |
